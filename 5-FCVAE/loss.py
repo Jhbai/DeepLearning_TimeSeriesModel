@@ -1,27 +1,46 @@
 import torch
+import numpy as np
+
+def log_likelihood(mean, variance, target):
+    """
+    :param mean: The prediction mean value
+    :param variance: The prediction variance
+    :param target: The ground truth
+    :return: The log likelihood value
+    """
+    LL = torch.sum(-.5*torch.log(2*np.pi*variance) - (target - mean)**2/(2*variance), dim = 1)
+    return torch.mean(LL)
+
 def kl_divergence(z_mean, z_logvar):
     """
-    計算 KL 散度
-    z_mean: 潛變量的均值 (batch_size, z_dim)
-    z_logvar: 潛變量的對數方差 (batch_size, z_dim)
+    Compute the KL-Divergence of latent space w.r.t N(0, 1)
+    
+    
+    :param z_mean: Mean of Latent, (n_batch, n_zdim)
+    :param z_logvar: Log variance of Latent, (n_batch, n_zdim)
+    :return: A single value of KL-Divergence in torch.tensor
     """
     kl = -0.5 * torch.sum(1 + z_logvar - z_mean.pow(2) - z_logvar.exp(), dim=-1)
     return kl.mean()  # 對 batch 求平均
 
-def vae_loss(x, mean, logvar, z_mean, z_logvar, beta=1.0):
+def criterion(mean, logvar, z_mean, z_logvar, x, beta=.5):
     """
-    VAE 的損失函數
-    x: 原始數據
-    mean, logvar: 解碼器的均值和對數方差
-    z_mean, z_logvar: 編碼器生成的潛變量均值和對數方差
-    beta: KL 散度的權重
-    """
-    # 重建損失
-    recon_loss = -log_likelihood(x, mean, logvar).mean()
+    Compute the reconstruct error via negative log_likelihood and KL-Divergence for VAE
     
-    # KL 散度
+    :param mean: The decoder for mean of the reconstruction
+    :param logvar: The decoder for log_variance of the reconstruction
+    :param z_mean: The mean of latent
+    :param z_logvar: The log_variance of latent
+    :param x: Raw data
+    :param beta: The weight of KL_Divergence
+    :return: The single value of total loss of the model
+    """
+    # Recons-Loss
+    recon_loss = -log_likelihood(mean, logvar.exp(), x).mean()
+    
+    # KLDiv-Loss
     kl_div = kl_divergence(z_mean, z_logvar)
     
-    # 損失函數
+    # Total_Loss
     loss = recon_loss + beta * kl_div
     return loss

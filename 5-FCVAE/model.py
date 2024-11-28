@@ -77,10 +77,10 @@ class VAE(nn.Module):
         out = self.Encoder(x)
         
         # Variational Inference
-        mean = self.mean(out)
-        logvar = self.logvar(out)
-        std = torch.exp(0.5*logvar)
-        z = torch.randn_like(std)*std + mean
+        z_mean = self.mean(out)
+        z_logvar = self.logvar(out)
+        std = torch.exp(0.5*z_logvar)
+        z = torch.randn_like(std)*std + z_mean
 
         # Decoder
         z = torch.cat((z, LF, GF), dim = 1)
@@ -92,6 +92,25 @@ class VAE(nn.Module):
         std = torch.exp(0.5*logvar)
         x_hat = torch.randn_like(std)*std + mean
         return x_hat
+
+    def train(self, x, LF, GF):
+        # Encoder
+        out = self.Encoder(x)
+        
+        # Variational Inference
+        z_mean = self.mean(out)
+        z_logvar = self.logvar(out)
+        std = torch.exp(0.5*z_logvar)
+        z = torch.randn_like(std)*std + z_mean
+
+        # Decoder
+        z = torch.cat((z, LF, GF), dim = 1)
+        out = self.Decoder(z)
+
+        # Variational Inference
+        mean = self.recon_mean(out)
+        logvar = self.recon_logvar(out)
+        return mean, logvar, z_mean, z_logvar
 
 class FCVAE(nn.Module):
     def __init__(self, n_dim, n_hid1, n_hid2, n_seq):
@@ -108,3 +127,10 @@ class FCVAE(nn.Module):
         lf = self.LFM(x)
         out = torch.cat((x, gf, lf), dim = 1)
         return self.VAE(out, gf, lf)
+
+    def train(self, x):
+        gf = self.GFM(x)
+        lf = self.LFM(x)
+        out = torch.cat((x, gf, lf), dim = 1)
+        mean, logvar, z_mean, z_logvar = self.VAE.train(out, gf, lf)
+        return mean, logvar, z_mean, z_logvar
