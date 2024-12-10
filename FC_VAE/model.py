@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from IPython.display import clear_output
 from torch.utils.data import DataLoader, Dataset
+device = "cuda"
 
 class MyDataSet(Dataset):
     def __init__(self, data):
@@ -67,9 +68,9 @@ class VAE(nn.Module):
         # Encoder
         self.Encoder = nn.Sequential(
             nn.Linear(n_hid, n_hid//2),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(n_hid//2, n_hid//4),
-            nn.GELU(),
+            nn.ReLU()
         )
         # Variational Inference
         self.mean = nn.Linear(n_hid//4, n_hid//8)
@@ -78,9 +79,9 @@ class VAE(nn.Module):
         # Decoder
         self.Decoder = nn.Sequential(
             nn.Linear(n_hid//8 + n_hid2*2, n_hid//4),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(n_hid//4, n_hid//2),
-            nn.GELU(),
+            nn.ReLU(),
         )
 
         # Variational Inference
@@ -104,11 +105,11 @@ class VAE(nn.Module):
         # Variational Inference
         mean = self.recon_mean(out)
         logvar = self.recon_logvar(out)
-        std = torch.exp(0.5*logvar)
-        x_hat = torch.randn_like(std)*std + mean
-        return x_hat
+        # std = torch.exp(0.5*logvar)
+        # x_hat = torch.randn_like(std)*std + mean
+        return mean
 
-    def train(self, x, LF, GF):
+    def fit(self, x, LF, GF):
         # Encoder
         out = self.Encoder(x)
         
@@ -142,35 +143,34 @@ class FCVAE(nn.Module):
         self.history = []
 
     def forward(self, x):
-        gf = self.GFM(x)
-        lf = self.LFM(x)
-        out = torch.cat((x, gf, lf), dim = 1)
-        return self.VAE(out, gf, lf)
+        x = self.z_score.transform(x)
+        data = self.to_tensor(self.cut_window(x, self.n_dim))
+        gf = self.GFM(data)
+        lf = self.LFM(data)
+        out = torch.cat((data, gf, lf), dim = 1)
+        out = self.VAE(out, gf, lf)
+        return out[:, -1]
         
     def anomaly(self, x):
-        res = list()
-        Data = self.to_tensor(self.cut_window(x, self.n_dim))
-        with tqdm(total = len(Data), desc = "training") as pbar:
-            for data in Data:
-                data = data.unsqueeze(0)
-                gf = self.GFM(data)
-                lf = self.LFM(data)
-                pred = self.VAE(torch.cat((data, gf, lf), dim = 1), gf, lf)
-                res += torch.mean((pred - data)**2, dim = 1).tolist()
-                pbar.update()
+        x = self.z_score.transform(x)
+        data = self.to_tensor(self.cut_window(x, self.n_dim))
+        gf = self.GFM(data)
+        lf = self.LFM(data)
+        pred = self.VAE(torch.cat((data, gf, lf), dim = 1), gf, lf)
+        res = torch.mean((pred - data)**2, dim = 1).tolist()
         return res
     
-    def train(self, tr_data, val_data = None):
+    def fit(self, tr_data, val_data = None):
         epoch = 0
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        tr_data = self.moving_average(tr_data)
+        self.z_score = z_score(tr_data)
+        tr_data = self.z_score.transform(tr_data)
         tr_data = self.to_tensor(self.cut_window(tr_data, self.n_dim))
-        tr_dataloader = DataLoader(MyDataSet(tr_data), batch_size = 32, shuffle = True)
+        tr_dataloader = DataLoader(MyDataSet(tr_data), batch_size = 128, shuffle = True)
         optimizer = optim.AdamW(self.parameters(), lr = 1e-4, weight_decay = 1e-2)
         if val_data is not None:
-            val_data = self.moving_average(val_data)
+            val_data = self.z_score.transform(val_data)
             val_data = self.to_tensor(self.cut_window(val_data, self.n_dim))
-            val_dataloader = DataLoader(MyDataSet(val_data), batch_size = 32, shuffle = True)
+            val_dataloader = DataLoader(MyDataSet(val_data), batch_size = 128, shuffle = True)
         while True:
             try:
                 epoch += 1
@@ -243,7 +243,7 @@ class FCVAE(nn.Module):
                     ax[0].legend()
                     ax[1].legend()
                     plt.show()
-
+                if epoch == 80: break
             except KeyboardInterrupt:
                 break
 
@@ -251,7 +251,7 @@ class FCVAE(nn.Module):
         gf = self.GFM(x)
         lf = self.LFM(x)
         out = torch.cat((x, gf, lf), dim = 1)
-        mean, logvar, z_mean, z_logvar = self.VAE.train(out, gf, lf)
+        mean, logvar, z_mean, z_logvar = self.VAE.fit(out, gf, lf)
         return mean, logvar, z_mean, z_logvar
     
     @staticmethod
@@ -263,22 +263,12 @@ class FCVAE(nn.Module):
 
     @staticmethod
     def to_tensor(arr):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return torch.tensor(arr).to(torch.float32).to(device)
-    
-    @staticmethod
-    def moving_average(arr):
-        import numpy as np
-        res = list()
-        for i in range(5, len(arr)):
-            res += [np.mean(arr[i-5:i])]
-        return res
     
     @staticmethod
     def data_aug(arr, r_pattern, r_val):
         # 套件引入
         import numpy as np
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 超參數初始化
         res = list() # 儲存結果地方
@@ -347,3 +337,11 @@ def criterion(mean, logvar, z_mean, z_logvar, x, beta=.5):
     # Total_Loss
     loss = recon_loss + beta * kl_div
     return loss
+
+class z_score:
+    def __init__(self, x):
+        self.mean = np.mean(x)
+        self.std = np.std(x)
+    def transform(self, data): 
+        out = (np.array(data) - self.mean)/self.std
+        return out
