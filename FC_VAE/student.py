@@ -1,5 +1,7 @@
 import torch
+import os, sys
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 import torch.nn as nn
 import torch.optim as optim
@@ -10,9 +12,19 @@ from torch.utils.data import DataLoader, Dataset
 
 import numpy as np
 import os, sys
-os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 sys.dont_write_bytecode = True
 
+class z_score:
+    def __init__(self, x):
+        self.mean = float(np.mean(x))
+        self.std = float(np.std(x))
+    def transform(self, data): 
+        out = (np.array(data) - self.mean)/self.std
+        return out
+    def reform(self, data):
+        out = data*self.std + self.mean
+        return out
+    
 class MyDataSet(Dataset):
     def __init__(self, data):
         self.data = data
@@ -23,7 +35,7 @@ class MyDataSet(Dataset):
         return x
 
 class Student(nn.Module):
-    def __init__(self, n_dim, n_hid):
+    def __init__(self, n_dim, n_hid, z_score):
         super(Student, self).__init__()
         self.encoder = nn.Sequential(
             nn.Linear(n_dim, n_dim//2),
@@ -43,6 +55,7 @@ class Student(nn.Module):
         self.quant = torch.quantization.QuantStub()
         self.dequant = torch.quantization.DeQuantStub()
         self.n_dim = n_dim
+        self.z_score = z_score
 
     def forward(self, x):
         x = self.z_score.transform(x)
@@ -52,88 +65,87 @@ class Student(nn.Module):
         out = self.encoder(x)
         out = self.decoder(out)
         out = self.dequant(out)
+        out = self.z_score.reform(out)
         return out[:, -1].tolist()
+    
+    def _train(self, x):
+        # Quantization
+        x = self.quant(x)
+
+        # Z and reconstruction
+        z = self.encoder(x)
+        x_hat = self.decoder(z)
+
+        # De-quantization
+        x_hat = self.dequant(x_hat)
+        z = self.dequant(z)
+
+        return x_hat, z
     
     def anomaly(self, x):
         x = self.z_score.transform(x)
-        x = [x[i-self.n_dim:i] for i in range(self.n_dim, len(x))]
-        x = torch.tensor(x).to(torch.float32)
-        qx = self.quant(x)
-        out = self.encoder(qx)
+        data = [x[i-self.n_dim:i] for i in range(self.n_dim, len(x))]
+        data = torch.tensor(data).to(torch.float32)
+        data = self.quant(data)
+        out = self.encoder(data)
         out = self.decoder(out)
-        out = self.dequant(out)
-        return torch.mean((out - x)**2, dim=1).tolist()
-
-    def _train(self, x):
-        x -= float(self.z_score.mu)
-        x /= float(self.z_score.std)
-        x = self.quant(x)
-        z = self.encoder(x)
-        x_hat = self.decoder(z)
-        x_hat = self.dequant(x_hat)
-        z = self.dequant(z)
-        return x_hat, z
+        pred = self.dequant(out)
+        recon = pred[:, -1]
+        scores = (recon - torch.tensor(x[-recon.shape[0]:]).to(torch.float32))**2
+        return scores.tolist()
     
-    def set_z_score(self, z_score):
-        self.z_score = z_score
-    
-
-def train_process(dataloader, teacher, student, optimizer):
-    total_loss_val = 0.0
-    feat_loss_val = 0.0
-    for data in dataloader:
-        true, _, teacher_z, _ = teacher._train(data.to(next(teacher.parameters()).device))
-        pred, student_z = student._train(data)
-        soft_trg_loss = nn.MSELoss()(pred, true.to("cpu"))
-        feat_loss = nn.MSELoss()(student_z, teacher_z.to("cpu"))
-        loss = soft_trg_loss + feat_loss
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        total_loss_val += loss.item()
-        feat_loss_val += feat_loss.item()
-    return total_loss_val, feat_loss_val
-
 def fit(data, teacher):
+    # Train the teacher first
+    teacher.train()
     teacher.fit(data)
-    student = Student(teacher.n_dim, (teacher.n_hid2 * 2 + teacher.n_dim)//8)
-    student.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
-    torch.quantization.prepare_qat(student, inplace=True)
-
     teacher.eval()
+
+    # Setup training paras
+    epochs = 0
+    history = list()
+    
+    # Call the student
+    _z_score = z_score(data)
+    student = Student(teacher.n_dim, (teacher.n_hid2 * 2 + teacher.n_dim)//8, _z_score)
     student.train()
+    data = _z_score.transform(data)
+    data = torch.tensor([data[i-teacher.n_dim:i] for i in range(teacher.n_dim, len(data))]).to(torch.float32)
+    dataloader = DataLoader(MyDataSet(data), batch_size = 1024, shuffle = True)
     optimizer = optim.AdamW(student.parameters(), lr = 1e-4, weight_decay = 1e-2)
-    epoch = 0
-    history = []
-    Z_score = z_score(data)
-    data = Z_score.transform(data)
-    student.set_z_score(Z_score)
-    x = torch.tensor([data[i-teacher.n_dim:i] for i in range(teacher.n_dim, len(data))]).to(torch.float32)
-    dataloader = DataLoader(MyDataSet(x), batch_size = 128, shuffle = True)
     while True:
         try:
-            epoch += 1
-            TL, FL = train_process(dataloader, teacher, student, optimizer)
-            history += [[TL, FL]]
+            epochs += 1
+            resp_loss = .0
+            feat_loss = .0
+            for d in dataloader:
+                x_t, _, f_t, _ = teacher._train(d.to(next(teacher.parameters()).device))
+                x_s, f_s = student._train(d)
+                r_loss = nn.MSELoss()(x_s, x_t.to(next(student.parameters()).device))
+                f_loss = nn.MSELoss()(f_s, f_t.to(next(student.parameters()).device))
+                loss = r_loss + f_loss
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                resp_loss += r_loss.item()
+                feat_loss += f_loss.item()
+            history += [[resp_loss, feat_loss]]
+
             fig, ax = plt.subplots(1, 2, figsize = (12, 2))
             clear_output()
-            ax[0].plot(np.array(history)[:, 0], color = "blue")
-            ax[1].plot(np.array(history)[:, 1], color = "green")
-            ax[0].grid()
-            ax[1].grid()
-            plt.title(f"Epoch {epoch}")
+            temp_hist = np.array(history)
+            ## 畫數值
+            ax[0].plot(temp_hist[:, 0], color = "blue", marker = '.', label = "responsive loss")
+            ax[1].plot(temp_hist[:, 1], color = "blue", marker = ".", label = "feature loss")
+
+            ## 畫窗格
+            ax[0].grid(linestyle = "--", color = "gray", alpha = .4)
+            ax[1].grid(linestyle = "--", color = "gray", alpha = .4)
+
+            ## 畫標籤
+            ax[0].legend()
+            ax[1].legend()
             plt.show()
-            if epoch == 80: break
+            if epochs == 100: break
         except KeyboardInterrupt:
             break
-    
-    torch.quantization.convert(student, inplace=True)
     return student
-    
-class z_score:
-    def __init__(self, x):
-        self.mu = np.mean(x)
-        self.std = np.std(x)
-    def transform(self, data):
-        out = (np.array(data) - self.mu)/self.std
-        return out
