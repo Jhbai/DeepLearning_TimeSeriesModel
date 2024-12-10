@@ -149,7 +149,8 @@ class FCVAE(nn.Module):
         lf = self.LFM(data)
         out = torch.cat((data, gf, lf), dim = 1)
         out = self.VAE(out, gf, lf)
-        return out[:, -1]
+        out = self.z_score.reform(out)
+        return out[:, -1].tolist()
         
     def anomaly(self, x):
         x = self.z_score.transform(x)
@@ -157,20 +158,29 @@ class FCVAE(nn.Module):
         gf = self.GFM(data)
         lf = self.LFM(data)
         pred = self.VAE(torch.cat((data, gf, lf), dim = 1), gf, lf)
-        res = torch.mean((pred - data)**2, dim = 1).tolist()
-        return res
+        recon = pred[:, -1]
+        scores = (recon - torch.tensor(x[-recon.shape[0]:]).to(torch.float32).to(device))**2
+        return scores.tolist()
     
     def fit(self, tr_data, val_data = None):
         epoch = 0
+
+        # z_score -> sliding window -> tensor -> data loader
         self.z_score = z_score(tr_data)
         tr_data = self.z_score.transform(tr_data)
         tr_data = self.to_tensor(self.cut_window(tr_data, self.n_dim))
-        tr_dataloader = DataLoader(MyDataSet(tr_data), batch_size = 128, shuffle = True)
+        tr_dataloader = DataLoader(MyDataSet(tr_data), batch_size = 1024, shuffle = True)
+
+        # optimizer
         optimizer = optim.AdamW(self.parameters(), lr = 1e-4, weight_decay = 1e-2)
+
+        # validation
         if val_data is not None:
             val_data = self.z_score.transform(val_data)
             val_data = self.to_tensor(self.cut_window(val_data, self.n_dim))
-            val_dataloader = DataLoader(MyDataSet(val_data), batch_size = 128, shuffle = True)
+            val_dataloader = DataLoader(MyDataSet(val_data), batch_size = 1024, shuffle = True)
+
+        # training process
         while True:
             try:
                 epoch += 1
@@ -178,10 +188,12 @@ class FCVAE(nn.Module):
                 tr_ll = 0.0
                 val_ll = 0.0
                 for batch in tr_dataloader:
+                    # start training
+                    self.train()
+
                     # normal data training
                     mean, logvar, z_mean, z_logvar = self._train(batch)
                     loss = criterion(mean, logvar, z_mean, z_logvar, batch)
-                    tr_ll += log_likelihood(mean, logvar.exp(), batch).item()
 
                     # abnormal data training
                     _, _, z_mean, z_logvar = self._train(self.data_aug(batch, .2, .1))
@@ -191,10 +203,16 @@ class FCVAE(nn.Module):
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
-                    tr_loss += loss.item()
+
+                    # evaluation
+                    self.eval()
+                    with torch.no_grad():
+                        tr_ll += log_likelihood(mean, logvar.exp(), batch).item()
+                        tr_loss += loss.item()
 
                 # validation
                 if val_data is not None:
+                    self.eval()
                     with torch.no_grad():
                         for batch in val_dataloader:
                             mean, logvar, z_mean, z_logvar = self._train(batch)
@@ -206,7 +224,7 @@ class FCVAE(nn.Module):
                     # Start to draw
                     clear_output()
                     temp_hist = np.array(self.history)
-                    fig, ax = plt.subplots(1, 2, figsize = (16, 3))
+                    fig, ax = plt.subplots(1, 2, figsize = (12, 2))
 
                     ## 畫數值
                     ax[0].plot(temp_hist[:, 0], color = "blue", marker = '.', label = "total loss")
@@ -243,7 +261,7 @@ class FCVAE(nn.Module):
                     ax[0].legend()
                     ax[1].legend()
                     plt.show()
-                if epoch == 80: break
+                if epoch == 32: break
             except KeyboardInterrupt:
                 break
 
@@ -340,8 +358,11 @@ def criterion(mean, logvar, z_mean, z_logvar, x, beta=.5):
 
 class z_score:
     def __init__(self, x):
-        self.mean = np.mean(x)
-        self.std = np.std(x)
+        self.mean = float(np.mean(x))
+        self.std = float(np.std(x))
     def transform(self, data): 
         out = (np.array(data) - self.mean)/self.std
+        return out
+    def reform(self, data):
+        out = data*self.std + self.mean
         return out
