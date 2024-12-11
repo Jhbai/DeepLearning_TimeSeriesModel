@@ -157,9 +157,8 @@ class FCVAE(nn.Module):
         data = self.to_tensor(self.cut_window(x, self.n_dim))
         gf = self.GFM(data)
         lf = self.LFM(data)
-        pred = self.VAE(torch.cat((data, gf, lf), dim = 1), gf, lf)
-        recon = pred[:, -1]
-        scores = (recon - torch.tensor(x[-recon.shape[0]:]).to(torch.float32).to(device))**2
+        recon = self.VAE(torch.cat((data, gf, lf), dim = 1), gf, lf)
+        scores = torch.mean((recon - data)**2, dim = 1)
         return scores.tolist()
     
     def fit(self, tr_data, val_data = None):
@@ -273,15 +272,14 @@ class FCVAE(nn.Module):
         return mean, logvar, z_mean, z_logvar
     
     @staticmethod
-    def cut_window(alist, n_dim):
-        data = list()
-        for i in range(n_dim, len(alist)):
-            data += [alist[i-n_dim:i]]
-        return data
+    def cut_window(arr, n_dim):
+        out = arr.unfold(0, n_dim, 1)
+        return out
+        
 
     @staticmethod
     def to_tensor(arr):
-        return torch.tensor(arr).to(torch.float32).to(device)
+        return arr.to(device)
     
     @staticmethod
     def data_aug(arr, r_pattern, r_val):
@@ -356,12 +354,13 @@ def criterion(mean, logvar, z_mean, z_logvar, x, beta=.5):
     loss = recon_loss + beta * kl_div
     return loss
 
-class z_score:
+class z_score(nn.Module):
     def __init__(self, x):
-        self.mean = float(np.mean(x))
-        self.std = float(np.std(x))
+        super(z_score, self).__init__()
+        self.mean = torch.mean(x)
+        self.std = torch.std(x)
     def transform(self, data): 
-        out = (np.array(data) - self.mean)/self.std
+        out = (data - self.mean)/self.std
         return out
     def reform(self, data):
         out = data*self.std + self.mean

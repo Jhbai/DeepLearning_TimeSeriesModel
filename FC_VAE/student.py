@@ -14,12 +14,13 @@ import numpy as np
 import os, sys
 sys.dont_write_bytecode = True
 
-class z_score:
+class z_score(nn.Module):
     def __init__(self, x):
-        self.mean = float(np.mean(x))
-        self.std = float(np.std(x))
-    def transform(self, data): 
-        out = (np.array(data) - self.mean)/self.std
+        super(z_score, self).__init__()
+        self.mean = torch.mean(x)
+        self.std = torch.std(x)
+    def forward(self, data): 
+        out = (data - self.mean)/self.std
         return out
     def reform(self, data):
         out = data*self.std + self.mean
@@ -59,14 +60,13 @@ class Student(nn.Module):
 
     def forward(self, x):
         x = self.z_score.transform(x)
-        x = [x[i-self.n_dim:i] for i in range(self.n_dim, len(x))]
-        x = torch.tensor(x).to(torch.float32)
+        x = x.unfold(0, self.n_dim, 1)
         x = self.quant(x)
         out = self.encoder(x)
         out = self.decoder(out)
         out = self.dequant(out)
         out = self.z_score.reform(out)
-        return out[:, -1].tolist()
+        return out[:, -1]
     
     def _train(self, x):
         # Quantization
@@ -84,19 +84,19 @@ class Student(nn.Module):
     
     def anomaly(self, x):
         x = self.z_score.transform(x)
-        data = [x[i-self.n_dim:i] for i in range(self.n_dim, len(x))]
+        data = x.unfold(0, self.n_dim, 1)
         data = torch.tensor(data).to(torch.float32)
         data = self.quant(data)
         out = self.encoder(data)
         out = self.decoder(out)
-        pred = self.dequant(out)
-        recon = pred[:, -1]
-        scores = (recon - torch.tensor(x[-recon.shape[0]:]).to(torch.float32))**2
+        recon = self.dequant(out)
+        scores = (recon - data[-recon.shape[0]:])**2
         return scores.tolist()
     
 def fit(data, teacher):
     # Train the teacher first
     teacher.train()
+    data = torch.tensor(data, dtype = torch.float32)
     teacher.fit(data)
     teacher.eval()
 
@@ -108,8 +108,11 @@ def fit(data, teacher):
     _z_score = z_score(data)
     student = Student(teacher.n_dim, (teacher.n_hid2 * 2 + teacher.n_dim)//8, _z_score)
     student.train()
+    student.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
+    student = torch.quantization.prepare_qat(student, inplace=False)
+    data = torch.tensor(data, dtype = torch.float32)
     data = _z_score.transform(data)
-    data = torch.tensor([data[i-teacher.n_dim:i] for i in range(teacher.n_dim, len(data))]).to(torch.float32)
+    data = data.unfold(0, teacher.n_dim, 1)
     dataloader = DataLoader(MyDataSet(data), batch_size = 1024, shuffle = True)
     optimizer = optim.AdamW(student.parameters(), lr = 1e-4, weight_decay = 1e-2)
     while True:
@@ -148,4 +151,4 @@ def fit(data, teacher):
             if epochs == 100: break
         except KeyboardInterrupt:
             break
-    return student
+    return torch.quantization.convert(student.eval(), inplace=False)
